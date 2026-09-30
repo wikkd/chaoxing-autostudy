@@ -1,0 +1,16 @@
+{
+  "name": "chaoxing-autostudy",
+  "version": "1.0.0",
+  "description": "超星学习通（chaoxing.com）网课学习辅助用户脚本：自动刷课 + AI 答题 + 检索增强，MIT 开源。",
+  "private": false,
+  "scripts": {
+    "build": "node build.js",
+    "watch": "node build.js --watch"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wikkd/chaoxing-autostudy.git"
+  },
+  "homepage": "https://github.com/wikkd/chaoxing-autostudy#readme"
+}
