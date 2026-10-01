@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习通网课辅助 (Chaoxing AutoStudy)
 // @namespace    https://github.com/wikkd/chaoxing-autostudy
-// @version      1.2.0
+// @version      1.2.5
 // @description  超星学习通（chaoxing.com）网课自动刷视频辅助用户脚本：静音自动播放 + 播完自动跳下一节 + 可选倍速。MIT 开源。
 // @author       wikkd
 // @homepage     https://github.com/wikkd/chaoxing-autostudy
@@ -133,6 +133,50 @@ const CX = {
         }
         return out;
     },
+    _lastJumpText: '',
+    findCatalogJump(force) {
+        let head = null;
+        for (const el of qsa('*')) {
+            if (visible(el) && !el.children.length && qtext(el) === '待完成任务点') { head = el; break; }
+        }
+        if (!head) return { ok: false };
+        let panel = head;
+        for (let i = 0; i < 6 && panel.parentElement; i++) {
+            panel = panel.parentElement;
+            if (qsa('li, [class*="catalog"], [class*="chapter"]', panel).length >= 3) break;
+        }
+        const rows = qsa('li, [class*="catalog"], [class*="chapter"]', panel).filter(r => visible(r) && r.offsetHeight > 16);
+        const icons = qsa('i, span, em, [class*="icon"], [class*="dot"], [class*="num"]', panel).filter(x =>
+            visible(x) && x.offsetWidth < 40 && x.offsetHeight < 40);
+        const rowOf = x => { let r = null; for (const row of rows) { if (row.contains(x) && (!r || r.contains(row))) r = row; } return r; };
+        let activeRow = null, activeDone = false;
+        for (const row of rows) {
+            if (/active|cur\b|selected|current|on\b/i.test(row.className || '')) {
+                if (!activeRow || (activeRow.contains(row) && activeRow !== row)) activeRow = row;
+            }
+        }
+        if (activeRow) {
+            const ic = icons.find(x => rowOf(x) === activeRow);
+            activeDone = ic ? !/^\d+$/.test(qtext(ic)) : false;
+        }
+        if (activeRow && !activeDone && !force) return { ok: true, jumped: false, activeDone: false, activeUnfinished: true };
+        for (const ic of icons) {
+            if (!/^\d+$/.test(qtext(ic))) continue;
+            const row = rowOf(ic);
+            if (!row || row === activeRow) continue;
+            const text = qtext(row).slice(0, 30);
+            if (text === CX._lastJumpText && Date.now() - (CX._lastJumpAt || 0) < 30000) continue;
+            CX._lastJumpText = text;
+            CX._lastJumpAt = Date.now();
+            CX_LOG.log('📌 目录跳转未完成任务点: ' + text, 'ok');
+            CX_LOG.progress('📌 跳转未完成章节…');
+            try { row.click(); } catch (e) {}
+            try { const inner = row.querySelector('span, div, a, [class*="text"], [class*="title"]'); if (inner) inner.click(); } catch (e) {}
+            CX._lastProgressAt = Date.now();
+            return { ok: true, jumped: true, text: text };
+        }
+        return { ok: true, jumped: false, activeDone: activeDone, unfinished: 0 };
+    },
     doneCourses() {
         try { return JSON.parse(GM_getValue(SK.doneCourses, '[]')) || []; } catch (e) { return []; }
     },
@@ -148,12 +192,14 @@ const CX = {
         if (CX._lastProgressAt === 0) CX._lastProgressAt = Date.now();
         if (/\/mycourses\/stu/.test(location.pathname)) { CX.tickCourseList(); return; }
         if (!/\/mycourse\/studentstudy/.test(location.href)) return;
+        const now = Date.now();
         let playing = CX.collectVideos(document, 0).some(v => !v.paused && !v.ended);
         if (playing) CX._lastProgressAt = Date.now();
-        const rpt = { frame: 0, vid: 0, btn: 0, play: 0 };
+        const rpt = { frame: 0, vid: 0, btn: 0, play: 0, taskDone: false };
         const visit = (doc, depth) => {
             if (depth > 3) return;
             rpt.frame++;
+            if (doc.body && /任务点已完成/.test(doc.body.innerText || '')) rpt.taskDone = true;
             for (const v of qsa('video', doc)) {
                 rpt.vid++;
                 if (muteEnabled && !v.muted) v.muted = true;
@@ -162,9 +208,20 @@ const CX = {
                     try { const p = v.play(); if (p && p.catch) p.catch(() => {}); rpt.play++; playing = true; CX._lastProgressAt = Date.now(); } catch (e) {}
                 }
                 if (!v.paused && !v.ended) playing = true;
-                if (!v._xaDone && v.duration > 0 && (v.ended || v.currentTime >= v.duration * 0.92)) {
-                    v._xaDone = true;
-                    CX_LOG.log('✅ 一个视频已看完（≥92%）', 'ok');
+                if (rpt.taskDone) {
+                    if (now - (CX._skipLogAt || 0) > 30000) {
+                        CX._skipLogAt = now;
+                        CX_LOG.log('⏭️ 任务点已完成，直接跳下一节', 'ok');
+                    }
+                    CX.clickNextSection();
+                    continue;
+                }
+                if (v.duration > 0 && (v.ended || v.currentTime >= v.duration * 0.92)) {
+                    if (!v._xaDone) {
+                        v._xaDone = true;
+                        CX._stuckSince = now; // 首次跨过 92% 的时刻，用于点击无效诊断
+                        CX_LOG.log('✅ 一个视频已看完（≥92%），跳转中', 'ok');
+                    }
                     CX.clickNextSection();
                 }
             }
@@ -187,8 +244,31 @@ const CX = {
             }
         };
         visit(document, 0);
-        const now = Date.now();
         const hasNext = !!CX.findNextButton();
+        let cat = null;
+        const stuckLong = CX._stuckSince && now - CX._stuckSince > 30000; // 92% 后 30s 未换走：目录图标可能没更新，强制跳
+        if (conf.autoPlay && now - (CX._catJumpAt || 0) > 8000) {
+            cat = CX.findCatalogJump(stuckLong);
+            CX._catJumpAt = now;
+            if (cat.ok && cat.jumped) { CX._pptSince = 0; CX._stuckSince = 0; return; }
+            if (cat.ok && !cat.activeDone && !cat.activeUnfinished && !rpt.taskDone) {
+                CX._pptSince = 0;
+                CX.gotoNextCourse();
+                return;
+            }
+        }
+        if (rpt.taskDone || CX._stuckSince) {
+            if (rpt.taskDone && now - (CX._skipLogAt || 0) > 30000) {
+                CX._skipLogAt = now;
+                CX_LOG.log('⏭️ 任务点已完成，直接跳下一节', 'ok');
+            }
+            CX.clickNextSection();
+        }
+        if (CX._stuckSince && now - CX._stuckSince > 30000) {
+            CX._stuckSince = 0;
+            const anti = qsa('iframe', document).filter(f => /antispider/i.test(f.src || '')).length;
+            CX_LOG.log('⚠️ 「下一节」点击 30s 未生效' + (anti ? '，检出 ' + anti + ' 个风控 iframe，需人工输验证码' : '（已改用目录切换）'), 'error');
+        }
         if (conf.autoPlay && !playing && rpt.vid === 0 && hasNext) {
             if (CX._pptSince === 0) CX._pptSince = now;
             if (now - CX._pptSince > 5000) { CX._pptSince = 0; CX.clickNextSection(); }
@@ -200,7 +280,10 @@ const CX = {
             CX_LOG.log('🔍 视频扫描: frames=' + rpt.frame + ' videos=' + rpt.vid
                 + ' playBtns=' + rpt.btn + ' playCalls=' + rpt.play
                 + (playing ? ' ▶播放中' : ' ⏸未播放') + ' autoPlay=' + !!conf.autoPlay
-                + (hasNext ? ' 下一节=√' : ' 下一节=×'), 'ai');
+                + (hasNext ? ' 下一节=√' : ' 下一节=×')
+                + (cat ? ' 目录=' + (cat.ok
+                    ? (cat.jumped ? '已跳转' : cat.activeDone ? '激活节已完成' : cat.activeUnfinished ? '激活节未完成(播放中)' : '无未完成节点')
+                    : '未找到面板') : '未解析'), 'ai');
         }
         if (conf.autoPlay && !playing && now - (CX._idleLogAt || 0) > 60000) {
             CX._idleLogAt = now;
