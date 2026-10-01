@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星学习通网课辅助 (Chaoxing AutoStudy)
 // @namespace    https://github.com/wikkd/chaoxing-autostudy
-// @version      1.1.1
+// @version      1.2.0
 // @description  超星学习通（chaoxing.com）网课自动刷视频辅助用户脚本：静音自动播放 + 播完自动跳下一节 + 可选倍速。MIT 开源。
 // @author       wikkd
 // @homepage     https://github.com/wikkd/chaoxing-autostudy
@@ -51,6 +51,8 @@ const CFG = {
 
 const SK = {
     autoPlay: 'xa_autoplay',
+    autoNextCourse: 'xa_auto_next_course', // 刷完当前课程自动换下一门（保底，默认开）
+    doneCourses: 'xa_done_courses',        // 已刷完的课程 courseId 列表（跨课程连刷跳过用）
     cxSpeed: 'xa_cx_speed',    // 视频倍速（1/1.25/1.5/2；默认 1x，改播放速度有风控风险，用户在面板显式开启）
     panelPos: 'xa_panel_pos',  // 面板/迷你球拖动位置
     minimized: 'xa_minimized', // 面板是否处于最小化
@@ -63,6 +65,7 @@ function loadCfg() {
     const b = v => v === true || v === 'true';
     conf = {
         autoPlay: b(g(SK.autoPlay, false)),
+        autoNextCourse: (v => v !== false && v !== 'false')(g(SK.autoNextCourse, true)),
         cxSpeed: parseFloat(g(SK.cxSpeed, '1')) || 1,
     };
 }
@@ -120,6 +123,8 @@ const CX = {
 
     _lastNext: 0,
     _nextErrAt: 0,
+    _lastProgressAt: 0, // 最近一次「有进展」的时刻：视频在播 / 成功点「下一节」
+    _pptSince: 0,       // 纯文档章节停留起始时刻
     collectVideos(doc, depth) {
         if (depth > 3) return [];
         let out = qsa('video', doc);
@@ -128,10 +133,23 @@ const CX = {
         }
         return out;
     },
+    doneCourses() {
+        try { return JSON.parse(GM_getValue(SK.doneCourses, '[]')) || []; } catch (e) { return []; }
+    },
+    markCourseDone(courseId) {
+        if (!courseId) return;
+        const list = CX.doneCourses();
+        if (list.indexOf(courseId) >= 0) return;
+        list.push(courseId);
+        try { GM_setValue(SK.doneCourses, JSON.stringify(list.slice(-300))); } catch (e) {}
+    },
     tick() {
         muteAll();
+        if (CX._lastProgressAt === 0) CX._lastProgressAt = Date.now();
+        if (/\/mycourses\/stu/.test(location.pathname)) { CX.tickCourseList(); return; }
         if (!/\/mycourse\/studentstudy/.test(location.href)) return;
         let playing = CX.collectVideos(document, 0).some(v => !v.paused && !v.ended);
+        if (playing) CX._lastProgressAt = Date.now();
         const rpt = { frame: 0, vid: 0, btn: 0, play: 0 };
         const visit = (doc, depth) => {
             if (depth > 3) return;
@@ -141,7 +159,7 @@ const CX = {
                 if (muteEnabled && !v.muted) v.muted = true;
                 if (v.playbackRate !== conf.cxSpeed) { try { v.playbackRate = conf.cxSpeed; } catch (e) {} }
                 if (conf.autoPlay && !playing && v.paused && !v.ended) {
-                    try { const p = v.play(); if (p && p.catch) p.catch(() => {}); rpt.play++; playing = true; } catch (e) {}
+                    try { const p = v.play(); if (p && p.catch) p.catch(() => {}); rpt.play++; playing = true; CX._lastProgressAt = Date.now(); } catch (e) {}
                 }
                 if (!v.paused && !v.ended) playing = true;
                 if (!v._xaDone && v.duration > 0 && (v.ended || v.currentTime >= v.duration * 0.92)) {
@@ -153,7 +171,7 @@ const CX = {
             for (const b of qsa('button, [role="button"], [class*="play"], a, div', doc)) {
                 if (qtext(b) !== '播放视频' || !visible(b)) continue;
                 rpt.btn++;
-                if (conf.autoPlay && !playing) { try { b.click(); playing = true; } catch (e) {} }
+                if (conf.autoPlay && !playing) { try { b.click(); playing = true; CX._lastProgressAt = Date.now(); } catch (e) {} }
             }
             for (const f of qsa('iframe', doc)) {
                 if (/antispider/i.test(f.src || '')) {
@@ -170,16 +188,76 @@ const CX = {
         };
         visit(document, 0);
         const now = Date.now();
+        const hasNext = !!CX.findNextButton();
+        if (conf.autoPlay && !playing && rpt.vid === 0 && hasNext) {
+            if (CX._pptSince === 0) CX._pptSince = now;
+            if (now - CX._pptSince > 5000) { CX._pptSince = 0; CX.clickNextSection(); }
+        } else if (rpt.vid > 0 || !hasNext) {
+            CX._pptSince = 0;
+        }
         if (now - (CX._rptAt || 0) > 30000) {
             CX._rptAt = now;
             CX_LOG.log('🔍 视频扫描: frames=' + rpt.frame + ' videos=' + rpt.vid
                 + ' playBtns=' + rpt.btn + ' playCalls=' + rpt.play
-                + (playing ? ' ▶播放中' : ' ⏸未播放') + ' autoPlay=' + !!conf.autoPlay, 'ai');
+                + (playing ? ' ▶播放中' : ' ⏸未播放') + ' autoPlay=' + !!conf.autoPlay
+                + (hasNext ? ' 下一节=√' : ' 下一节=×'), 'ai');
         }
         if (conf.autoPlay && !playing && now - (CX._idleLogAt || 0) > 60000) {
             CX._idleLogAt = now;
-            CX_LOG.progress('⏳ 等待视频任务点…');
+            CX_LOG.progress(hasNext ? '⏳ 等待视频任务点…' : '⏳ 无下一节，检查是否可换课…');
         }
+        if (conf.autoPlay && conf.autoNextCourse && !playing && now - CX._lastProgressAt > 90000) {
+            CX.gotoNextCourse();
+        }
+    },
+    findNextButton() {
+        let btn = null;
+        qsa('button, a, [role="button"], [class*="next"], [class*="Next"]').forEach(el => {
+            if (btn || !visible(el)) return;
+            if (qtextAll(el) === '下一节') btn = el;
+        });
+        return btn;
+    },
+    tickCourseList() {
+        if (!conf.autoPlay || !conf.autoNextCourse) return;
+        const now = Date.now();
+        if (now - (CX._listAt || 0) < 5000) return; // 5s 节流
+        CX._listAt = now;
+        const done = CX.doneCourses();
+        const entries = qsa('a, button, [role="button"], [class*="btn"], span, div').filter(el => {
+            if (!visible(el) || qtextAll(el) !== '课程学习') return false;
+            const link = el.tagName === 'A' ? el : (el.closest && el.closest('a'));
+            return link && link.href && /courseId=(\d+)/.test(link.href) ? true : !!link;
+        });
+        for (const el of entries) {
+            const link = el.tagName === 'A' ? el : (el.closest && el.closest('a'));
+            const href = (link && link.href) || '';
+            const m = href.match(/courseId=(\d+)/);
+            if (m && done.indexOf(m[1]) >= 0) continue; // 已刷完，跳过
+            CX_LOG.log('📖 换下一门课：进入课程' + (m ? ' ' + m[1] : ''), 'ok');
+            CX_LOG.progress('📖 切换下一门课程…');
+            try {
+                if (href) location.href = href;
+                else { el.click(); CX._lastProgressAt = Date.now(); }
+            } catch (e) {}
+            return;
+        }
+        if (now - (CX._listEmptyLogAt || 0) > 30000) {
+            CX._listEmptyLogAt = now;
+            if (entries.length === 0) CX_LOG.log('课程列表未找到「课程学习」入口（未登录/页面改版？）', 'error');
+            else CX_LOG.log('✅ 全部课程均已刷完（已完成 ' + done.length + ' 门），挂机待命', 'ok');
+            CX_LOG.progress('✅ 课程全部完成' + (entries.length ? '' : '，等待人工处理'));
+        }
+    },
+    gotoNextCourse() {
+        const now = Date.now();
+        if (now - (CX._switchAt || 0) < 60000) return; // 冷却防连环切
+        CX._switchAt = now;
+        const m = location.href.match(/courseId=(\d+)/);
+        CX.markCourseDone(m ? m[1] : '');
+        CX_LOG.log('🏁 本课程任务点已刷完（90s 无进展），自动换下一门课', 'ok');
+        CX_LOG.progress('🏁 换下一门课程…');
+        try { location.href = 'https://i.chaoxing.com/mooc-ans/mycourses/stu'; } catch (e) {}
     },
     bindStudyTop() {
         window.addEventListener('message', (e) => {
@@ -190,14 +268,11 @@ const CX = {
     clickNextSection() {
         const now = Date.now();
         if (now - CX._lastNext < 8000) return;
-        let btn = null;
-        qsa('button, a, [role="button"], [class*="next"], [class*="Next"]').forEach(el => {
-            if (btn || !visible(el)) return;
-            if (qtextAll(el) === '下一节') btn = el;
-        });
+        const btn = CX.findNextButton();
         if (btn) {
             CX._lastNext = now;
-            CX_LOG.log('▶ 视频已看完（≥92%），点击「下一节」', 'ok');
+            CX._lastProgressAt = now;
+            CX_LOG.log('▶ 点击「下一节」', 'ok');
             CX_LOG.progress('▶ 跳转下一节…');
             try { btn.click(); } catch (e) {}
         } else if (now - CX._nextErrAt > 30000) {
@@ -311,6 +386,10 @@ function buildPanel() {
       <span style="font-size:12px;color:#374151;font-weight:600;">全自动刷课</span>
       <div class="xa-switch" id="xa-autoplay-switch" title="开启自动刷课"></div>
     </div>
+    <div class="xa-row" style="justify-content:space-between;">
+      <span style="font-size:12px;color:#374151;font-weight:600;">刷完自动换课</span>
+      <div class="xa-switch" id="xa-nextcourse-switch" title="一门课刷完（90s 无进展）自动回课程列表进入下一门"></div>
+    </div>
     <button class="xa-mute">🔇 关闭静音</button>
     <select class="xa-input" id="xa-cx-speed" title="视频倍速（默认 1x，改速度有风控风险请自行斟酌）">
       <option value="1">视频倍速：1x（默认，最稳）</option>
@@ -423,6 +502,17 @@ function bindUI() {
         refreshPlaySwitch();
     });
 
+    const nextCourseSwitch = $('#xa-nextcourse-switch');
+    function refreshNextCourseSwitch() {
+        nextCourseSwitch.classList.toggle('on', !!conf.autoNextCourse);
+    }
+    nextCourseSwitch.addEventListener('click', () => {
+        conf.autoNextCourse = !conf.autoNextCourse;
+        GM_setValue(SK.autoNextCourse, String(conf.autoNextCourse));
+        refreshNextCourseSwitch();
+        CX_LOG.log(conf.autoNextCourse ? '刷完自动换课已开启' : '刷完自动换课已关闭', 'info');
+    });
+
     $('#xa-clear-log').addEventListener('click', () => {
         CX_LOG.logLines = [];
         const box = document.getElementById('xa-ai-log');
@@ -447,6 +537,7 @@ function bindUI() {
     }
 
     refreshPlaySwitch();
+    refreshNextCourseSwitch();
 }
 
 
